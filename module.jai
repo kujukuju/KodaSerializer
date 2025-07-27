@@ -6,17 +6,27 @@ Dehydrated :: struct (T: Type) {
     data: T;
 }
 
-serializer_read :: ($T: Type, data: [] u8, validate_modtime: bool = false) -> bool, T {
-    #run print("Checking %.\n", T);
+serializer_hydrate :: (dehydrated: Dehydrated($T)) -> T {
+    info :: type_info(T);
+
+    hydrated: T;
+    memcpy(*hydrated, *dehydrated.data, info.runtime_size);
+    serializer_hydrate(*hydrated, info);
+
+    return hydrated;
+}
+
+serializer_read :: ($T: Type, data: [] u8, validate_modtime: bool = false) -> bool, Dehydrated(T) {
     info :: type_info(T);
     #run validate_generic(info);
 
     assert(data.count >= info.runtime_size, "Not enough serialization data for reading. %\n", T);
 
-    value: T;
-    memcpy(*value, data.data, info.runtime_size);
+    value: Dehydrated(T);
+    value.memory = data.data;
+    memcpy(*value.data, data.data, info.runtime_size);
 
-    serializer_read_generic(*value, data, info);
+    serializer_read_generic(*value.data, data, info);
 
     return true, value;
 }
@@ -84,13 +94,124 @@ is_pod :: (info: *Type_Info) -> bool {
         case .VARIANT;
             variant_info := cast(*Type_Info_Variant) info;
             return is_pod(variant_info.variant_of);
+        case .PROCEDURE;
+            return false;
         case;
-            assert(false, "Unsupported is_pod type. % %\nMaybe you need to @serializer(skip) this?\n", info.type, (cast(*Type) *info).*);
+            assert(false, "Unsupported is_pod type. % %\nMaybe you need to @serializer_skip this?\n", info.type, (cast(*Type) *info).*);
             return false;
     }
 }
 
 #scope_file
+
+serializer_hydrate_initialize :: (output: *void, info: *Type_Info) {
+    if info.type == .STRUCT && (cast(*Type_Info_Struct) info).initializer {
+        (cast(*Type_Info_Struct) info).initializer(output);
+    } else {
+        memset(output, 0, info.runtime_size);
+    }
+}
+
+serializer_hydrate :: (output: *void, info: *Type_Info) {
+    if is_pod(info) {
+        return;
+    }
+
+    if info.type == {
+        case .STRING;
+            output_string := cast(*string) output;
+            output_string.* = copy_string(output_string.*);
+
+        case .POINTER;
+            pointer_info := cast(*Type_Info_Pointer) info;
+
+            output_pointer := cast(**void) output;
+
+            if output_pointer.* {
+                allocated := alloc(pointer_info.pointer_to.runtime_size);
+                memcpy(allocated, output_pointer.*, pointer_info.pointer_to.runtime_size);
+                output_pointer.* = allocated;
+
+                serializer_hydrate(output_pointer.*, pointer_info.pointer_to);
+            }
+
+        case .STRUCT;
+            struct_info := cast(*Type_Info_Struct) info;
+
+            struct_type := (cast(*Type) *info).*;
+            if struct_type == Allocator {
+                allocator := cast(*Allocator) output;
+                allocator.* = context.allocator;
+                return;
+            }
+
+            for member: struct_info.members {
+                if member.flags & .CONSTANT {
+                    continue;
+                }
+
+                if is_pod(member.type) {
+                    continue;
+                }
+
+                if array_find(member.notes, "serializer_skip") {
+                    serializer_hydrate_initialize(output + member.offset_in_bytes, member.type);
+                    continue;
+                }
+
+                serializer_hydrate(output + member.offset_in_bytes, member.type);
+            }
+
+        case .ARRAY;
+            array_info := cast(*Type_Info_Array) info;
+
+            if #complete array_info.array_type == {
+                case .FIXED;
+                    assert(!is_pod(array_info.element_type), "Hydrating a fixed array that's pod. This should never happen.\n");
+                    for i: 0..array_info.array_count - 1 {
+                        output_member := output + i * array_info.element_type.runtime_size;
+                        serializer_hydrate(output_member, array_info.element_type);
+                    }
+
+                case .VIEW;
+                    output_array := cast(*Array_View_64) output;
+
+                    allocated := alloc(output_array.count * array_info.element_type.runtime_size);
+                    memcpy(allocated, output_array.data, output_array.count * array_info.element_type.runtime_size);
+                    output_array.data = allocated;
+
+                    if !is_pod(array_info.element_type) {
+                        for i: 0..output_array.count - 1 {
+                            output_member := output_array.data + i * array_info.element_type.runtime_size;
+                            serializer_hydrate(output_member, array_info.element_type);
+                        }
+                    }
+
+                case .RESIZABLE;
+                    output_array := cast(*Resizable_Array) output;
+
+                    allocated := alloc(output_array.count * array_info.element_type.runtime_size);
+                    memcpy(allocated, output_array.data, output_array.count * array_info.element_type.runtime_size);
+                    output_array.data = allocated;
+                    output_array.allocated = output_array.count;
+                    output_array.allocator = context.allocator;
+
+                    if !is_pod(array_info.element_type) {
+                        for i: 0..output_array.count - 1 {
+                            output_member := output_array.data + i * array_info.element_type.runtime_size;
+                            serializer_hydrate(output_member, array_info.element_type);
+                        }
+                    }
+            }
+
+        case .VARIANT;
+            variant_info := cast(*Type_Info_Variant) info;
+            serializer_hydrate(output, variant_info.variant_of);
+
+        case;
+            assert(false, "Unsupported non-pod hydrate type. %\n", info.type);
+    }
+}
 
 serializer_write_generic :: (output: [] u8, index: int, data: *void, info: *Type_Info) -> int {
     if is_pod(info) {
@@ -110,7 +231,7 @@ serializer_write_generic :: (output: [] u8, index: int, data: *void, info: *Type
             variant_info := cast(*Type_Info_Variant) info;
             index = serializer_write_generic(output, index, data, variant_info.variant_of);
         case;
-            assert(false, "Sunpported non-pod write type. %\n", info.type);
+            assert(false, "Unsupported non-pod write type. %\n", info.type);
     }
 
     return index;
@@ -150,12 +271,21 @@ serializer_write_pointer :: (output: [] u8, index: int, data: *void, info: *Type
 }
 
 serializer_write_struct :: (output: [] u8, index: int, data: *void, info: *Type_Info_Struct) -> int {
+    struct_type := (cast(*Type) *info).*;
+    if struct_type == Allocator {
+        return index;
+    }
+
     for member: info.members {
         if member.flags & .CONSTANT {
             continue;
         }
 
         if is_pod(member.type) {
+            continue;
+        }
+
+        if array_find(member.notes, "serializer_skip") {
             continue;
         }
 
@@ -250,7 +380,7 @@ serializer_read_generic :: (value: *void, data: [] u8, info: *Type_Info) {
             variant_info := cast(*Type_Info_Variant) info;
             serializer_read_generic(value, data, variant_info.variant_of);
         case;
-            assert(false, "Sunpported non-pod read type. %\n", info.type);
+            assert(false, "Unsupported non-pod read type. %\n", info.type);
     }
 }
 
@@ -273,12 +403,23 @@ serializer_read_pointer :: (value: *void, data: [] u8, info: *Type_Info_Pointer)
 }
 
 serializer_read_struct :: (value: *void, data: [] u8, info: *Type_Info_Struct) {
+    struct_type := (cast(*Type) *info).*;
+    if struct_type == Allocator {
+        allocator := cast(*Allocator) value;
+        allocator.* = assert_allocator;
+        return;
+    }
+
     for member: info.members {
         if member.flags & .CONSTANT {
             continue;
         }
 
         if is_pod(member.type) {
+            continue;
+        }
+
+        if array_find(member.notes, "serializer_skip") {
             continue;
         }
 
@@ -378,6 +519,10 @@ validate_struct :: (info: *Type_Info_Struct, validated_parent: *Validated) -> bo
             continue;
         }
 
+        if array_find(member_a.notes, "serializer_skip") {
+            continue;
+        }
+
         range_a := int.[member_a.offset_in_bytes, member_a.offset_in_bytes + member_a.type.runtime_size - 1];
 
         // since member_a is not pod, we will check for any overlapping member_b values
@@ -394,7 +539,7 @@ validate_struct :: (info: *Type_Info_Struct, validated_parent: *Validated) -> bo
 
             overlapping := range_a[0] <= range_b[1] && range_a[1] >= range_b[0];
             if overlapping {
-                assert(false, "Found overlapping non-pod struct members. %\nMaybe @serializer(skip) this?\n%\nt\t%\n\t%", info.name, member_a.name, member_b.name);
+                assert(false, "Found overlapping non-pod struct members.\nMaybe @serializer_skip this?\n%\nt\t%\n\t%", info.name, member_a.name, member_b.name);
                 return false;
             }
         }
