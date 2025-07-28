@@ -1,5 +1,7 @@
 
-#module_parameters(COMPILE_TIME_BAKE: bool = false);
+#module_parameters(VERIFY_TYPES: bool = true, HASH_TYPES: bool = true, HASH_NAMES: bool = false, COMPILE_TIME_BAKE: bool = false);
+
+#assert HASH_TYPES || !HASH_NAMES "You cannot enable HASH_NAMES without enabling HASH_TYPES.\n";
 
 Dehydrated :: struct (T: Type) {
     memory: *void;
@@ -16,31 +18,58 @@ serializer_hydrate :: (dehydrated: Dehydrated($T)) -> T {
     return hydrated;
 }
 
-serializer_read :: ($T: Type, data: [] u8, validate_modtime: bool = false) -> bool, Dehydrated(T) {
+serializer_read :: ($T: Type, data: [] u8, hash: u64 = FNV_64_OFFSET_BIAS) -> bool, Dehydrated(T) {
     info :: type_info(T);
     #run validate_generic(info);
 
-    assert(data.count >= info.runtime_size, "Not enough serialization data for reading. %\n", T);
+    if data.count < info.runtime_size + size_of(u64) {
+        assert(false, "Not enough serialization data for reading. %\n", T);
+        return false, .{};
+    }
+
+    if VERIFY_TYPES {
+        data_hash: u64;
+        memcpy(*data_hash, data.data, size_of(u64));
+
+        type_hash := serializer_get_hash(info, hash);
+        if data_hash != type_hash {
+            return false, .{};
+        }
+    }
+
+    data_view: [] u8;
+    data_view.data = data.data + size_of(u64);
+    data_view.count = data.count - size_of(u64);
 
     value: Dehydrated(T);
-    value.memory = data.data;
-    memcpy(*value.data, data.data, info.runtime_size);
+    value.memory = data_view.data;
+    memcpy(*value.data, data_view.data, info.runtime_size);
 
-    serializer_read_generic(*value.data, data, info);
+    serializer_read_generic(*value.data, data_view, info);
 
     return true, value;
 }
 
-serializer_write :: (data: $T) -> [] u8 {
+serializer_write :: (data: $T, hash: u64 = FNV_64_OFFSET_BIAS) -> [] u8 {
     info :: type_info(T);
     #run validate_generic(info);
 
     output_size := serializer_get_size(*data, info);
+    output := NewArray(output_size + size_of(u64), u8);
 
-    output := NewArray(output_size, u8);
-    index, written := write_data(output, 0, *data, info.runtime_size);
+    hash: u64 = 0;
+    if HASH_TYPES {
+        hash = serializer_get_hash(info, hash);
+    }
+    memcpy(output.data, *hash, size_of(u64));
 
-    index = serializer_write_generic(output, index, written, info);
+    output_view: [] u8;
+    output_view.data = output.data + size_of(u64);
+    output_view.count = output.count - size_of(u64);
+
+    index, written := write_data(output_view, 0, *data, info.runtime_size);
+
+    index = serializer_write_generic(output_view, index, written, info);
     assert(index == output_size, "Serializer wrote unexpected number of bytes. % % %\n", T, index, output_size);
 
     return output;
@@ -53,6 +82,99 @@ serializer_get_size :: (data: $T) -> int {
 
 serializer_get_size :: (data: *void, info: *Type_Info) -> int {
     return info.runtime_size + serializer_write_generic(.[], 0, data, info);
+}
+
+serializer_get_hash :: (info: *Type_Info, hash: u64 = FNV_64_OFFSET_BIAS) -> u64 {
+    serializer_get_hash :: (info: *Type_Info, hash: u64, validated_parent: *Validated = null) -> u64 {
+        validated_child: Validated;
+        validated_child.info = info;
+        validated_child.parent = validated_parent;
+
+        hash = fnv1a_hash(cast(u64) info.type, hash);
+        hash = fnv1a_hash(cast(u64) info.runtime_size, hash);
+        hash = fnv1a_hash(0xffffffff, hash);
+
+        if info.type == {
+            case .INTEGER;
+                integer_info := cast(*Type_Info_Integer) info;
+                hash = fnv1a_hash(cast(u64) integer_info.signed, hash);
+
+            case .FLOAT;
+            case .BOOL;
+            case .STRING;
+
+            case .POINTER;
+                pointer_info := cast(*Type_Info_Pointer) info;
+                hash = serializer_get_hash(pointer_info.pointer_to, hash, *validated_child);
+
+            case .STRUCT;
+                if validated_parent && has_parent(validated_parent, info) {
+                    return hash;
+                }
+
+                struct_info := cast(*Type_Info_Struct) info;
+                if HASH_NAMES {
+                    hash = fnv1a_hash(cast(u64) struct_info.name.count, hash);
+                    hash = fnv1a_hash(struct_info.name.data, struct_info.name.count, hash);
+                }
+                hash = fnv1a_hash(cast(u64) struct_info.members.count);
+                for member: struct_info.members {
+                    if member.flags & .CONSTANT {
+                        continue;
+                    }
+                    if array_find(member.notes, "serializer_skip") {
+                        continue;
+                    }
+                    if HASH_NAMES {
+                        hash = fnv1a_hash(cast(u64) member.name.count, hash);
+                        hash = fnv1a_hash(member.name.data, member.name.count, hash);
+                    }
+                    hash = fnv1a_hash(cast(u64) member.offset_in_bytes, hash);
+                    hash = serializer_get_hash(member.type, hash, *validated_child);
+                }
+
+            case .ARRAY;
+                array_info := cast(*Type_Info_Array) info;
+                hash = fnv1a_hash(cast(u64) array_info.array_type, hash);
+                if array_info.array_type == .FIXED {
+                    hash = fnv1a_hash(cast(u64) array_info.array_count, hash);
+                }
+                hash = serializer_get_hash(array_info.element_type, hash, *validated_child);
+
+            case .ENUM;
+                enum_info := cast(*Type_Info_Enum) info;
+                if HASH_NAMES {
+                    hash = fnv1a_hash(cast(u64) enum_info.name.count, hash);
+                    hash = fnv1a_hash(enum_info.name.data, enum_info.name.count, hash);
+                }
+                hash = fnv1a_hash(cast(u64) enum_info.names.count);
+                for name: enum_info.names {
+                    hash = fnv1a_hash(cast(u64) name.count, hash);
+                    hash = fnv1a_hash(name.data, name.count, hash);
+                }
+                hash = fnv1a_hash(cast(u64) enum_info.values.count);
+                for value: enum_info.values {
+                    hash = fnv1a_hash(cast,no_check(u64) value, hash);
+                }
+                hash = serializer_get_hash(enum_info.internal_type, hash, *validated_child);
+
+            case .VARIANT;
+                variant_info := cast(*Type_Info_Variant) info;
+                if HASH_NAMES {
+                    hash = fnv1a_hash(cast(u64) variant_info.name.count, hash);
+                    hash = fnv1a_hash(variant_info.name.data, variant_info.name.count, hash);
+                }
+                hash = serializer_get_hash(variant_info.variant_of, hash, *validated_child);
+
+            case;
+                assert(false, "Unsupported serializer hash type. %\n", info.type);
+        }
+
+        hash = fnv1a_hash(0xffffffff, hash);
+        return hash;
+    }
+
+    return serializer_get_hash(info, hash, null);
 }
 
 is_pod :: ($T: Type) -> bool {
@@ -559,4 +681,7 @@ assert_allocator_proc :: (mode: Allocator_Mode, size: s64, old_size: s64, old_me
 
 assert_allocator :: Allocator.{assert_allocator_proc, null};
 
+FNV_64_OFFSET_BIAS: u64 : 0xcbf29ce484222325;
+
 #import "Basic";
+#import "Hash";
